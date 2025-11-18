@@ -292,7 +292,7 @@
   {% do return(load_result('get_columns_in_relation').table) %}
 {% endmacro %}
 
--- //\\ zsn  ANALYTICS-5837 --------------------------------------------------- begin
+-- //\\ zsn  ANALYTICS-5837 --------------------------------------------------- begin.
 -- Spark iceberg can't show table extended, here is a workaround for dbt-spark-bork
 {% macro __original__________spark__list_relations_without_caching(relation) %}
   {% call statement('list_relations_without_caching', fetch_result=True) -%}
