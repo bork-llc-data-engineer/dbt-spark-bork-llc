@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from threading import Lock
 
 from dbt.adapters.contracts.connection import (
     AdapterResponse,
@@ -13,6 +14,7 @@ from dbt_common.exceptions import DbtConfigError, DbtRuntimeError, DbtDatabaseEr
 
 from dbt_common.utils.encoding import DECIMALS
 from dbt.adapters.spark import __version__
+from dbt.adapters.spark.livysession import LivyConnectionManager, LivySessionConnectionWrapper
 
 try:
     from TCLIService.ttypes import TOperationState as ThriftState
@@ -30,7 +32,7 @@ from datetime import datetime
 import sqlparams
 from dbt_common.dataclass_schema import StrEnum
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
+from typing import Any, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence, Hashable
 
 from abc import ABC, abstractmethod
 
@@ -47,7 +49,7 @@ import base64
 import time
 
 logger = AdapterLogger("Spark")
-
+lock = Lock()
 NUMBERS = DECIMALS + (int, float)
 
 
@@ -60,6 +62,7 @@ class SparkConnectionMethod(StrEnum):
     HTTP = "http"
     ODBC = "odbc"
     SESSION = "session"
+    LIVY = "livy"
 
 
 @dataclass
@@ -84,7 +87,11 @@ class SparkCredentials(Credentials):
     use_ssl: bool = False
     server_side_parameters: Dict[str, str] = field(default_factory=dict)
     retry_all: bool = False
-
+    livy_session_parameters: Dict[str, Any] = field(default_factory=dict)
+    verify_ssl_certificate: Optional[bool] = True
+    livy_session_pool_size: int = 1
+    livy_keep_session_alive: bool = True
+    
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
         data = super().__pre_deserialize__(data)
@@ -347,7 +354,16 @@ class SparkConnectionManager(SQLConnectionManager):
     SPARK_CLUSTER_HTTP_PATH = "/sql/protocolv1/o/{organization}/{cluster}"
     SPARK_SQL_ENDPOINT_HTTP_PATH = "/sql/1.0/endpoints/{endpoint}"
     SPARK_CONNECTION_URL = "{host}:{port}" + SPARK_CLUSTER_HTTP_PATH
+    connection_managers: Dict[Hashable, LivyConnectionManager] = {}
 
+    # слот пула -> LivyConnectionManager
+    connection_managers: Dict[int, LivyConnectionManager] = {}
+    # thread_id -> номер слота пула
+    thread_slots: Dict[Hashable, int] = {}
+    # фактический размер пула (инициализируем по первому коннекту)
+    livy_pool_size: int = 0
+    livy_keep_session_alive: bool = True
+    
     @contextmanager
     def exception_handler(self, sql: str) -> Generator[None, None, None]:
         try:
@@ -541,6 +557,68 @@ class SparkConnectionManager(SQLConnectionManager):
                     handle = SessionConnectionWrapper(
                         Connection(server_side_parameters=creds.server_side_parameters)
                     )
+
+                elif creds.method == SparkConnectionMethod.LIVY:
+                    cls.livy_keep_session_alive = getattr(creds, "livy_keep_session_alive", True)
+                    lock.acquire()
+                    try:
+                        thread_id = cls.get_thread_identifier()
+
+                        # 1) инициализируем размер пула по профилю
+                        if cls.livy_pool_size == 0:
+                            pool_size = getattr(creds, "livy_session_pool_size", None) or 1
+                            try:
+                                cls.livy_pool_size = max(1, int(pool_size))
+                            except Exception:
+                                cls.livy_pool_size = 1
+                        # теперь cls.livy_pool_size > 0
+
+                        # 2) находим слот пула для этого thread
+                        if thread_id in cls.thread_slots:
+                            slot = cls.thread_slots[thread_id]
+                        else:
+                            # если ещё есть свободные слоты — создаём новый
+                            if len(cls.connection_managers) < cls.livy_pool_size:
+                                slot = len(cls.connection_managers)
+                            else:
+                                # иначе делим потоки по уже существующим слотам
+                                slot = hash(thread_id) % cls.livy_pool_size
+
+                            cls.thread_slots[thread_id] = slot
+
+                        # 3) создаём LivyConnectionManager для слота, если ещё нет
+                        if slot not in cls.connection_managers:
+                            cls.connection_managers[slot] = LivyConnectionManager()
+
+                        livy_mgr = cls.connection_managers[slot]
+
+                        # 4) коннектимся через выбранный менеджер
+                        handle = LivySessionConnectionWrapper(  # type: ignore
+                            livy_mgr.connect(
+                                creds.host,
+                                creds.user,
+                                creds.password,
+                                creds.auth,
+                                creds.livy_session_parameters,
+                                creds.verify_ssl_certificate,
+                            )
+                        )
+                        connection.state = ConnectionState.OPEN  # type: ignore
+
+                        session_id = getattr(livy_mgr.livy_global_session, "session_id", None)
+                        logger.debug(
+                            f"[LIVY POOL] thread_id={thread_id}, slot={slot}, session_id={session_id}"
+                        )
+
+                    except Exception as ex:
+                        logger.debug("Connection error: {}".format(ex))
+                        connection.state = ConnectionState.FAIL  # type: ignore
+                        raise ex
+
+                    finally:
+                        lock.release()
+
+
                 else:
                     raise DbtConfigError(f"invalid credential method: {creds.method}")
                 break

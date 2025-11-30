@@ -518,6 +518,18 @@ class SparkAdapter(SQLAdapter):
         """Override for DebugTask method"""
         self.execute("select 1 as id")
 
+    def cleanup_connections(self) -> None:
+        self.connections.cleanup_all()
+        logger.debug("cleanup_connections")
+
+        # Убивать livy-сессии только если в профиле явно сказали livy_keep_session_alive: false
+        if not SparkConnectionManager.livy_keep_session_alive:
+            # close all sessions
+            for conn_mgr in SparkConnectionManager.connection_managers:
+                SparkConnectionManager.connection_managers[conn_mgr].delete_session()
+
+            SparkConnectionManager.connection_managers = {}
+
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:
         table_format: Optional[str] = None
